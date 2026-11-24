@@ -554,7 +554,7 @@ final class DatabricksClient {
         var retriedAuth = false
         var c = compat(for: model)
         for attempt in 0..<6 {
-            var r = try request(host, "/serving-endpoints/\(model)/invocations", token: token)
+            let isService = model.contains("."); var r = try request(host, isService ? "/ai-gateway/mlflow/v1/chat/completions" : "/serving-endpoints/\(model)/invocations", token: token)
             r.httpMethod = "POST"
             r.timeoutInterval = timeout
             let user = "<<<\n\(raw)\n>>>"
@@ -562,7 +562,7 @@ final class DatabricksClient {
             let messages: [[String: String]] = c.systemRole
                 ? [["role": "system", "content": prompt], ["role": "user", "content": user]]
                 : [["role": "user", "content": prompt + "\n\n" + user]]
-            var body: [String: Any] = ["messages": messages]
+            var body: [String: Any] = ["messages": messages]; if isService { body["model"] = model }
             if c.temperature { body["temperature"] = 0 }
             if c.maxTokensKey == "max_completion_tokens" {
                 body["max_completion_tokens"] = min(8192, max(2048, raw.count * 4))
@@ -865,6 +865,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let tokenField = NSSecureTextField()
     private let shortcutButton = NSButton(title: "", target: nil, action: nil)
     private let modelPopup = NSPopUpButton()
+    private let customModelField = NSTextField()
     private let saveButton = NSButton(title: "Test & Save", target: nil, action: nil)
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
     private let vocabField = NSTextField()
@@ -983,7 +984,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         shortcutButton.action = #selector(recordShortcut)
 
         modelPopup.removeAllItems()
-        modelPopup.addItem(withTitle: s.model.isEmpty ? "(auto-detected after sign-in)" : s.model)
+        modelPopup.addItem(withTitle: s.model.isEmpty ? "(auto-detected after sign-in)" : s.model); customModelField.placeholderString = "Optional: catalog.schema.service_name"; customModelField.stringValue = s.model.contains(".") ? s.model : ""; customModelField.widthAnchor.constraint(equalToConstant: 380).isActive = true
 
         saveButton.keyEquivalent = "\r"
         saveButton.target = self
@@ -1003,6 +1004,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [NSGridCell.emptyContentView, authLabel],
             [label("Push-to-talk shortcut"), shortcutButton],
             [label("Model"), modelPopup],
+            [label("Model service"), customModelField],
             [label("Advanced"), patCheck],
             [label("Personal access token"), tokenField]
         ])
@@ -1202,7 +1204,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 let token = try await OAuthManager.shared.bearerToken(host: host)
                 let models = try await DatabricksClient.shared.listChatModels(host: host, token: token)
                 guard !models.isEmpty else { throw DBError.noModel }
-                let model = models.contains(chosen) ? chosen : DatabricksClient.pickDefault(models)
+                let custom = self.customModelField.stringValue.trimmingCharacters(in: .whitespaces); let model = !custom.isEmpty ? custom : (models.contains(chosen) ? chosen : DatabricksClient.pickDefault(models))
                 self.modelPopup.removeAllItems()
                 self.modelPopup.addItems(withTitles: models)
                 self.modelPopup.selectItem(withTitle: model)
