@@ -1,5 +1,5 @@
 #!/bin/bash
-# Bricksper installer v1.2
+# Bricksper installer v1.3 (Genie voice mode)
 # Install / upgrade : bash install_bricksper.sh
 # Uninstall         : bash install_bricksper.sh --uninstall
 set -euo pipefail
@@ -28,7 +28,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   while security delete-generic-password -s com.local.dictabricks >/dev/null 2>&1; do :; done
   defaults delete "$BUNDLE_ID" >/dev/null 2>&1 || true
   defaults delete com.local.dictabricks >/dev/null 2>&1 || true
-  rm -f "$HOME/Library/Logs/$APP_NAME.log" "$HOME/Library/Logs/DictaBricks.log"
+  rm -f "$HOME/Library/Logs/$APP_NAME.log" "$HOME/Library/Logs/$APP_NAME.old.log" "$HOME/Library/Logs/DictaBricks.log"
   ok "Removed app, settings, saved sign-in, permissions and logs."
   exit 0
 fi
@@ -44,7 +44,7 @@ fi
 ok "macOS $(sw_vers -productVersion)"
 
 pkill -x "$APP_NAME" 2>/dev/null || true
-rm -rf "$SRC"
+rm -rf "$SRC/Sources" "$SRC/Resources" "$SRC/build" "$SRC/Package.swift"
 mkdir -p "$SRC/Sources/$APP_NAME" "$SRC/Resources"
 cd "$SRC"
 say "Writing source files to $SRC"
@@ -68,8 +68,8 @@ cat > Resources/Info.plist <<'EOF'
   <key>CFBundleIdentifier</key><string>com.local.bricksper</string>
   <key>CFBundleExecutable</key><string>Bricksper</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.2</string>
-  <key>CFBundleVersion</key><string>3</string>
+  <key>CFBundleShortVersionString</key><string>1.3</string>
+  <key>CFBundleVersion</key><string>4</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
   <key>NSMicrophoneUsageDescription</key><string>Bricksper listens only while you hold the push-to-talk shortcut.</string>
@@ -159,6 +159,10 @@ final class Settings {
         get { d.stringArray(forKey: "vocabulary") ?? ["Databricks", "Unity Catalog", "Lakebase", "Genie", "PySpark", "Delta Lake", "SQL", "Lakeflow", "MLflow"] }
         set { d.set(newValue, forKey: "vocabulary") }
     }
+    var genieEnabled: Bool {
+        get { d.object(forKey: "genieEnabled") as? Bool ?? true }
+        set { d.set(newValue, forKey: "genieEnabled") }
+    }
     var isConfigured: Bool {
         guard !host.isEmpty, !model.isEmpty else { return false }
         return authMode == "pat" ? !token.isEmpty : oauth != nil
@@ -228,7 +232,11 @@ final class HotkeyManager {
     func register(_ hk: Hotkey) {
         unregister()
         let id = EventHotKeyID(signature: OSType(0x42524B53), id: 1)
-        RegisterEventHotKey(hk.keyCode, hk.carbonModifiers, id, GetApplicationEventTarget(), 0, &ref)
+        let status = RegisterEventHotKey(hk.keyCode, hk.carbonModifiers, id, GetApplicationEventTarget(), 0, &ref)
+        if status != noErr {
+            ref = nil
+            Log.write("Shortcut \(hk.display) could not be registered (OSStatus \(status)). Another app may already use it; pick a different one in Settings.")
+        }
     }
 
     func unregister() {
@@ -281,9 +289,20 @@ final class SpeechEngine {
 
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            request = nil
+            throw NSError(domain: "Bricksper", code: 1, userInfo: [NSLocalizedDescriptionKey: "No microphone input is available. Check System Settings > Sound > Input."])
+        }
+        input.removeTap(onBus: 0)
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in req.append(buffer) }
         engine.prepare()
-        try engine.start()
+        do {
+            try engine.start()
+        } catch {
+            input.removeTap(onBus: 0)
+            request = nil
+            throw error
+        }
 
         task = recognizer?.recognitionTask(with: req) { [weak self] result, error in
             DispatchQueue.main.async {
@@ -322,7 +341,8 @@ final class SpeechEngine {
     }
 
     func cancel() {
-        if engine.isRunning { engine.stop(); engine.inputNode.removeTap(onBus: 0) }
+        if engine.isRunning { engine.stop() }
+        engine.inputNode.removeTap(onBus: 0)
         task?.cancel(); task = nil; request = nil; finalHandler = nil
     }
 }
@@ -341,12 +361,28 @@ enum Paster {
         _ = AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
     }
 
-    @discardableResult
-    static func paste(_ text: String) -> Bool {
+    static func copy(_ text: String, html: String? = nil) {
         let pb = NSPasteboard.general
-        let saved = pb.string(forType: .string)
         pb.clearContents()
+        if let html, !html.isEmpty { pb.setString(html, forType: .html) }
         pb.setString(text, forType: .string)
+    }
+
+    private static func snapshot(_ pb: NSPasteboard) -> [NSPasteboardItem] {
+        (pb.pasteboardItems ?? []).map { item in
+            let clone = NSPasteboardItem()
+            for t in item.types {
+                if let d = item.data(forType: t) { clone.setData(d, forType: t) }
+            }
+            return clone
+        }
+    }
+
+    @discardableResult
+    static func paste(_ text: String, html: String? = nil) -> Bool {
+        let pb = NSPasteboard.general
+        let saved = snapshot(pb)
+        copy(text, html: html)
         let ourChange = pb.changeCount
 
         guard hasAccessibility else {
@@ -356,9 +392,10 @@ enum Paster {
         }
         waitForModifiersReleased {
             sendCmdV()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                if pb.changeCount == ourChange, let saved {
-                    pb.clearContents(); pb.setString(saved, forType: .string)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                if pb.changeCount == ourChange, !saved.isEmpty {
+                    pb.clearContents()
+                    pb.writeObjects(saved)
                 }
             }
         }
@@ -390,18 +427,43 @@ import Foundation
 enum Log {
     static let url = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Logs/Bricksper.log")
+    private static let queue = DispatchQueue(label: "com.local.bricksper.log")
+    private static let formatter = ISO8601DateFormatter()
+    private static let maxBytes = 5_000_000
+
     static func write(_ s: String) {
-        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(s)\n"
-        if let h = try? FileHandle(forWritingTo: url) {
-            h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close()
-        } else {
-            try? line.write(to: url, atomically: true, encoding: .utf8)
+        let now = Date()
+        Log.queue.async {
+            let line = "[\(Log.formatter.string(from: now))] \(s)\n"
+            Log.rotateIfNeeded()
+            if let h = try? FileHandle(forWritingTo: Log.url) {
+                h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close()
+            } else {
+                try? line.write(to: Log.url, atomically: true, encoding: .utf8)
+            }
         }
+    }
+
+    static func ensureExists() {
+        Log.queue.sync {
+            if !FileManager.default.fileExists(atPath: Log.url.path) {
+                FileManager.default.createFile(atPath: Log.url.path, contents: nil)
+            }
+        }
+    }
+
+    private static func rotateIfNeeded() {
+        let fm = FileManager.default
+        guard let size = (try? fm.attributesOfItem(atPath: Log.url.path))?[.size] as? NSNumber,
+              size.intValue > Log.maxBytes else { return }
+        let old = Log.url.deletingPathExtension().appendingPathExtension("old.log")
+        try? fm.removeItem(at: old)
+        try? fm.moveItem(at: Log.url, to: old)
     }
 }
 
 enum DBError: LocalizedError {
-    case badHost, http(Int, String), empty, noModel, truncated, tooShort
+    case badHost, http(Int, String), empty, noModel, truncated, tooShort, genieScope, genieFailed(String)
     var errorDescription: String? {
         switch self {
         case .badHost: return "Host URL is not valid."
@@ -410,12 +472,16 @@ enum DBError: LocalizedError {
         case .noModel: return "No chat model endpoints found in this workspace."
         case .truncated: return "The model hit its output limit (raw text used)."
         case .tooShort: return "The model dropped too much text (raw text used)."
+        case .genieScope: return "Genie scope not available for this sign-in (raw question pasted). Sign out and sign in again."
+        case .genieFailed(let t): return "Genie did not finish (\(t)); raw question pasted."
         }
     }
 }
 
 final class DatabricksClient {
     static let shared = DatabricksClient()
+    var genieConversationID: String?
+    var genieLastCall: Date?
 
     private let session: URLSession = {
         let c = URLSessionConfiguration.default
@@ -507,7 +573,7 @@ final class DatabricksClient {
         return n
     }
 
-    private func request(_ host: String, _ path: String, token: String) throws -> URLRequest {
+    func request(_ host: String, _ path: String, token: String) throws -> URLRequest {
         guard let url = URL(string: host + path), url.host != nil else { throw DBError.badHost }
         var r = URLRequest(url: url)
         r.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -572,7 +638,7 @@ final class DatabricksClient {
             r.httpBody = try JSONSerialization.data(withJSONObject: body)
 
             let params = body.filter { $0.key != "messages" }.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ", ")
-            var preview = "POST /serving-endpoints/\(model)/invocations\n"
+            var preview = "POST " + (isService ? "/ai-gateway/mlflow/v1/chat/completions (model \(model))" : "/serving-endpoints/\(model)/invocations") + "\n"
             preview += "Parameters: " + (params.isEmpty ? "(model defaults)" : params) + "\n"
             for m in messages { preview += "\n---- " + (m["role"] ?? "") + " ----\n" + (m["content"] ?? "") + "\n" }
             Self.lastRequestPreview = preview
@@ -632,6 +698,511 @@ final class DatabricksClient {
     }
 }
 EOF
+cat > Sources/Bricksper/Genie.swift <<'EOF'
+import Foundation
+import AppKit
+import ApplicationServices
+
+struct GenieRequest {
+    var question: String
+    var followUp: Bool
+    var fresh: Bool
+}
+
+enum GenieRouter {
+    static let fillers: Set<String> = ["um", "uh", "er", "so", "ok", "okay", "hey", "hi", "hello", "yo", "ah", "hmm"]
+    static let triggers: Set<String> = ["genie", "jeannie", "jeanie", "gini", "jini", "jinny", "djinni", "genii"]
+    static let freshPhrases = ["new question", "new conversation", "start over"]
+    static let followPhrases = ["follow up", "follow-up", "followup", "and also", "also"]
+    private static let skip = CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters).union(.symbols)
+
+    static func detect(_ raw: String) -> GenieRequest? {
+        var rest = Substring(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        var found = false
+        while !rest.isEmpty {
+            let next = nextWord(rest)
+            if next.word.isEmpty { break }
+            if triggers.contains(next.word) { found = true; rest = next.rest; break }
+            if fillers.contains(next.word) { rest = next.rest; continue }
+            break
+        }
+        guard found else { return nil }
+        rest = trimLeading(rest)
+        var followUp = false
+        var fresh = false
+        if let r = stripPhrase(rest, freshPhrases) {
+            fresh = true
+            rest = r
+        } else if let r = stripPhrase(rest, followPhrases) {
+            followUp = true
+            rest = r
+        }
+        let q = String(trimLeading(rest)).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return nil }
+        let question = String(q.prefix(1)).uppercased() + String(q.dropFirst())
+        return GenieRequest(question: question, followUp: followUp, fresh: fresh)
+    }
+
+    private static func isSkip(_ c: Character) -> Bool {
+        c.unicodeScalars.allSatisfy { skip.contains($0) }
+    }
+
+    private static func trimLeading(_ s: Substring) -> Substring {
+        var i = s.startIndex
+        while i < s.endIndex && isSkip(s[i]) { i = s.index(after: i) }
+        return s[i...]
+    }
+
+    private static func nextWord(_ s: Substring) -> (word: String, rest: Substring) {
+        let t = trimLeading(s)
+        var j = t.startIndex
+        while j < t.endIndex && (t[j].isLetter || t[j] == "'") { j = t.index(after: j) }
+        return (String(t[t.startIndex..<j]).lowercased(), t[j...])
+    }
+
+    private static func stripPhrase(_ s: Substring, _ phrases: [String]) -> Substring? {
+        let lower = s.lowercased()
+        for p in phrases where lower.hasPrefix(p) {
+            let after = s.dropFirst(p.count)
+            if let c = after.first, c.isLetter { continue }
+            return trimLeading(after)
+        }
+        return nil
+    }
+}
+
+enum MarkdownPlain {
+    static func convert(_ md: String) -> String {
+        let md = dropCitations(md)
+        var lines = md.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
+        while let last = lines.last, isFootnote(last) { lines.removeLast() }
+        var out: [String] = []
+        for raw in lines {
+            var l = sub(raw, #"<a\s+[^>]*>\s*</a>"#, "")
+            let t = l.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("|") && t.count > 1 {
+                if isSeparator(t) { continue }
+                l = cells(t).joined(separator: "\t")
+            }
+            l = sub(l, #"^\s{0,3}#{1,6}\s+"#, "")
+            l = sub(l, #"^\s*>\s?"#, "")
+            l = plainLinks(l)
+            l = l.replacingOccurrences(of: "**", with: "")
+            l = l.replacingOccurrences(of: "`", with: "")
+            l = sub(l, #"\\([\\`*_{}\[\]()#+.!|~>-])"#, "$1")
+            l = sub(l, " +$", "")
+            if l.isEmpty && (out.last ?? "").isEmpty { continue }
+            out.append(l)
+        }
+        return out.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func html(_ md: String) -> String {
+        let md = dropCitations(md)
+        var lines = md.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
+        while let last = lines.last, isFootnote(last) { lines.removeLast() }
+        let cellStyle = "border:1px solid #999999;padding:4px 8px;vertical-align:top"
+        var out = "<meta charset=\"utf-8\"><div style=\"font-family:Arial,sans-serif;font-size:11pt\">"
+        var para: [String] = []
+        var list = ""
+        var table: [[String]] = []
+        var tableHasHeader = false
+        func flushPara() {
+            if !para.isEmpty { out += "<p>" + para.joined(separator: "<br>") + "</p>"; para = [] }
+        }
+        func flushList() {
+            if !list.isEmpty { out += "</" + list + ">"; list = "" }
+        }
+        func flushTable() {
+            guard !table.isEmpty else { return }
+            out += "<table style=\"border-collapse:collapse\">"
+            for (i, row) in table.enumerated() {
+                let header = tableHasHeader && i == 0
+                let tag = header ? "th" : "td"
+                let style = header ? cellStyle + ";background:#f2f2f2;font-weight:bold;text-align:left" : cellStyle
+                var tr = "<tr>"
+                for c in row { tr += "<" + tag + " style=\"" + style + "\">" + inline(c) + "</" + tag + ">" }
+                out += tr + "</tr>"
+            }
+            out += "</table><br>"
+            table = []
+            tableHasHeader = false
+        }
+        for raw in lines {
+            let t = raw.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("|") && t.count > 1 {
+                flushPara()
+                flushList()
+                if isSeparator(t) {
+                    if table.count == 1 { tableHasHeader = true }
+                    continue
+                }
+                table.append(cells(t))
+                continue
+            }
+            flushTable()
+            if t.isEmpty || t.range(of: #"^<a\s+[^>]*>\s*</a>$"#, options: .regularExpression) != nil {
+                flushPara()
+                flushList()
+                continue
+            }
+            if let r = t.range(of: #"^#{1,6}\s+"#, options: .regularExpression) {
+                flushPara()
+                flushList()
+                out += "<p><b>" + inline(String(t[r.upperBound...])) + "</b></p>"
+                continue
+            }
+            if let r = t.range(of: #"^[-*+]\s+"#, options: .regularExpression) {
+                flushPara()
+                if list != "ul" { flushList(); out += "<ul>"; list = "ul" }
+                out += "<li>" + inline(String(t[r.upperBound...])) + "</li>"
+                continue
+            }
+            if let r = t.range(of: #"^\d+[.)]\s+"#, options: .regularExpression) {
+                flushPara()
+                if list != "ol" { flushList(); out += "<ol>"; list = "ol" }
+                out += "<li>" + inline(String(t[r.upperBound...])) + "</li>"
+                continue
+            }
+            flushList()
+            let body = t.hasPrefix(">") ? String(t.dropFirst()).trimmingCharacters(in: .whitespaces) : t
+            para.append(inline(body))
+        }
+        flushPara()
+        flushList()
+        flushTable()
+        return out + "</div>"
+    }
+
+    private static func inline(_ s: String) -> String {
+        var l = sub(s, #"<a\s+[^>]*>\s*</a>"#, "")
+        l = l.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;").replacingOccurrences(of: ">", with: "&gt;")
+        l = sub(l, #"!?\[([^\]]*)\]\((https?://[^)\s]+)\)"#, "<a href=\"$2\">$1</a>")
+        l = sub(l, #"!?\[([^\]]*)\]\([^)]*\)"#, "$1")
+        l = sub(l, #"(?<![="'>/])(https?://[^\s<)]*[^\s<).,;:!?'"])"#, "<a href=\"$1\">$1</a>")
+        l = sub(l, #"\\([\\`*_{}\[\]()#+.!|~>-])"#, "$1")
+        l = sub(l, #"\*\*(.+?)\*\*"#, "<b>$1</b>")
+        return l.replacingOccurrences(of: "**", with: "").replacingOccurrences(of: "`", with: "")
+    }
+
+    static func isFootnote(_ line: String) -> Bool {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        if t.isEmpty || t.hasPrefix("**Source") || t.hasPrefix("TABLE:") || t.hasPrefix("QUERY:") { return true }
+        if t.range(of: #"^Source \d+"#, options: .regularExpression) != nil { return true }
+        return t.range(of: #"^<a\s+[^>]*>\s*</a>$"#, options: .regularExpression) != nil
+    }
+
+    static func cells(_ row: String) -> [String] {
+        var r = row
+        if r.hasPrefix("|") { r.removeFirst() }
+        if r.hasSuffix("|") { r.removeLast() }
+        return r.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    static func isSeparator(_ row: String) -> Bool {
+        let cs = cells(row)
+        return !cs.isEmpty && cs.allSatisfy { $0.range(of: "^:?-+:?$", options: .regularExpression) != nil }
+    }
+
+    static func sub(_ s: String, _ pattern: String, _ template: String) -> String {
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return s }
+        return re.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: template)
+    }
+}
+
+extension MarkdownPlain {
+    static func plainLinks(_ s: String) -> String {
+        var l = sub(s, #"!?\[(https?://[^\]\s]+)\]\((https?://[^)\s]+)\)"#, "$2")
+        l = sub(l, #"!?\[([^\]]*)\]\((https?://[^)\s]+)\)"#, "$1 ($2)")
+        return sub(l, #"!?\[([^\]]*)\]\([^)]*\)"#, "$1")
+    }
+
+    static func dropCitations(_ md: String) -> String {
+        sub(md, #"[ \t]*(Query Result[ \t]*)?\[[^\]]*\]\(#source-[^)]*\)"#, "")
+    }
+}
+
+enum PasteTarget: String {
+    case document, spreadsheet, chat, slides, plain
+
+    static func detect() -> (kind: PasteTarget, label: String) {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return (.document, "unknown app") }
+        let id = (app.bundleIdentifier ?? "").lowercased()
+        let name = app.localizedName ?? id
+        let title = windowTitle(app.processIdentifier).lowercased()
+        let label = title.isEmpty ? name : name + " - " + String(title.prefix(60))
+        let hay = id + " " + title
+        func has(_ keys: [String]) -> Bool { keys.contains { hay.contains($0) } }
+        if has(["com.microsoft.excel", "com.apple.iwork.numbers", "google sheets"]) { return (.spreadsheet, label) }
+        if has(["com.microsoft.powerpoint", "com.apple.iwork.keynote", "google slides"]) { return (.slides, label) }
+        if has(["google docs", "com.microsoft.word", "com.apple.iwork.pages"]) { return (.document, label) }
+        if has(["com.tinyspeck.slackmacgap", " - slack", "| slack", "slack |"]) { return (.chat, label) }
+        if has(["com.apple.terminal", "com.googlecode.iterm2", "com.microsoft.vscode", "com.apple.dt.xcode", "dev.warp", "com.todesktop.230313mzl4w4u92"]) { return (.plain, label) }
+        return (.document, label)
+    }
+
+    private static func windowTitle(_ pid: pid_t) -> String {
+        guard AXIsProcessTrusted() else { return "" }
+        let app = AXUIElementCreateApplication(pid)
+        var win: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &win) == .success, let win else { return "" }
+        var title: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(win as! AXUIElement, kAXTitleAttribute as CFString, &title) == .success else { return "" }
+        return (title as? String) ?? ""
+    }
+}
+
+enum PasteFormatter {
+    static func format(_ md: String, for target: PasteTarget) -> (text: String, html: String?) {
+        switch target {
+        case .document:
+            return (MarkdownPlain.convert(md), MarkdownPlain.html(md))
+        case .spreadsheet:
+            guard let t = tablesOnly(md) else { return (MarkdownPlain.convert(md), nil) }
+            return (MarkdownPlain.convert(t), MarkdownPlain.html(t))
+        case .slides:
+            let s = slideOutline(md)
+            return (MarkdownPlain.convert(s), MarkdownPlain.html(s))
+        case .chat:
+            return (slack(md), nil)
+        case .plain:
+            return (MarkdownPlain.convert(md), nil)
+        }
+    }
+
+    private static func tablesOnly(_ md: String) -> String? {
+        var out: [String] = []
+        var inTable = false
+        for line in md.components(separatedBy: "\n") {
+            let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if t.hasPrefix("|") {
+                if !inTable && !out.isEmpty { out.append("") }
+                out.append(t)
+                inTable = true
+            } else {
+                inTable = false
+            }
+        }
+        return out.isEmpty ? nil : out.joined(separator: "\n")
+    }
+
+    private static func slideOutline(_ md: String) -> String {
+        var out: [String] = []
+        var paragraphs = 0
+        var inPara = false
+        for line in md.components(separatedBy: "\n") {
+            let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let numbered = t.range(of: #"^\d+[.)]\s"#, options: .regularExpression) != nil
+            let structural = t.hasPrefix("#") || t.hasPrefix("|") || t.hasPrefix("- ") || t.hasPrefix("* ") || t.hasPrefix("+ ") || numbered
+            if t.isEmpty { inPara = false; out.append(""); continue }
+            if structural { inPara = false; out.append(t); continue }
+            if t.hasPrefix(">") || t.hasPrefix("<a ") { continue }
+            if t.hasPrefix("**") && t.hasSuffix("**") && t.count < 60 { out.append(t); continue }
+            if !inPara { paragraphs += 1; inPara = true }
+            if paragraphs <= 1 { out.append(t) }
+        }
+        return out.joined(separator: "\n")
+    }
+
+    static func slack(_ md: String) -> String {
+        var lines = MarkdownPlain.dropCitations(md).replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
+        while let last = lines.last, MarkdownPlain.isFootnote(last) { lines.removeLast() }
+        var out: [String] = []
+        var table: [[String]] = []
+        func flushTable() {
+            guard !table.isEmpty else { return }
+            let hasURL = table.contains { row in row.contains { $0.contains("http://") || $0.contains("https://") } }
+            if hasURL {
+                let header = table.count > 1 ? table[0] : []
+                let rows = table.count > 1 ? Array(table.dropFirst()) : table
+                for row in rows {
+                    var bits: [String] = []
+                    for (i, c) in row.enumerated() where i > 0 && !c.isEmpty {
+                        let h = i < header.count ? header[i] : ""
+                        bits.append(h.isEmpty ? c : h + ": " + c)
+                    }
+                    let first = row.first ?? ""
+                    let lead = (first.contains("http") || first.isEmpty) ? first : "*" + first + "*"
+                    out.append("• " + lead + (bits.isEmpty ? "" : " — " + bits.joined(separator: " · ")))
+                }
+                table = []
+                return
+            }
+            var widths: [Int] = []
+            for row in table {
+                for (i, c) in row.enumerated() {
+                    if i >= widths.count { widths.append(c.count) } else { widths[i] = max(widths[i], c.count) }
+                }
+            }
+            out.append("```")
+            for (r, row) in table.enumerated() {
+                var parts: [String] = []
+                for (i, c) in row.enumerated() {
+                    parts.append(i == row.count - 1 ? c : c.padding(toLength: widths[i], withPad: " ", startingAt: 0))
+                }
+                out.append(parts.joined(separator: "  "))
+                if r == 0 && table.count > 1 { out.append(widths.map { String(repeating: "-", count: $0) }.joined(separator: "  ")) }
+            }
+            out.append("```")
+            table = []
+        }
+        for raw in lines {
+            let t = raw.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("|") && t.count > 1 {
+                if !MarkdownPlain.isSeparator(t) { table.append(MarkdownPlain.cells(t).map { plainCell($0) }) }
+                continue
+            }
+            flushTable()
+            if t.range(of: #"^<a\s+[^>]*>\s*</a>$"#, options: .regularExpression) != nil { continue }
+            if let r = t.range(of: #"^#{1,6}\s+"#, options: .regularExpression) {
+                out.append("*" + plainCell(String(t[r.upperBound...])) + "*")
+                continue
+            }
+            if let r = t.range(of: #"^[-*+]\s+"#, options: .regularExpression) {
+                out.append("• " + slackInline(String(t[r.upperBound...])))
+                continue
+            }
+            let body = t.hasPrefix(">") ? "> " + String(t.dropFirst()).trimmingCharacters(in: .whitespaces) : t
+            if body.isEmpty && (out.last ?? "").isEmpty { continue }
+            out.append(slackInline(body))
+        }
+        flushTable()
+        return out.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func plainCell(_ s: String) -> String {
+        var l = MarkdownPlain.plainLinks(s)
+        l = MarkdownPlain.sub(l, #"\\([\\`*_{}\[\]()#+.!|~>-])"#, "$1")
+        return l.replacingOccurrences(of: "**", with: "").replacingOccurrences(of: "`", with: "")
+    }
+
+    private static func slackInline(_ s: String) -> String {
+        var l = MarkdownPlain.plainLinks(s)
+        l = MarkdownPlain.sub(l, #"\\([\\`*_{}\[\]()#+.!|~>-])"#, "$1")
+        l = MarkdownPlain.sub(l, #"\*\*(.+?)\*\*"#, "*$1*")
+        return l.replacingOccurrences(of: "**", with: "")
+    }
+}
+
+extension DatabricksClient {
+    private static let genieSession: URLSession = {
+        let c = URLSessionConfiguration.default
+        c.timeoutIntervalForRequest = 180
+        c.timeoutIntervalForResource = 180
+        return URLSession(configuration: c)
+    }()
+
+    static func genieFinalAnswer(_ rsp: [String: Any]) -> String {
+        let items = (rsp["output"] as? [[String: Any]]) ?? []
+        var texts: [String] = []
+        for item in items where (item["phase"] as? String) == "final_answer" {
+            let parts = (item["content"] as? [[String: Any]]) ?? []
+            for part in parts where (part["type"] as? String) == "output_text" {
+                if let t = part["text"] as? String { texts.append(t) }
+            }
+        }
+        return texts.joined(separator: "\n\n")
+    }
+
+    static func genieProgressNote(_ item: [String: Any]) -> String? {
+        let parts = (item["content"] as? [[String: Any]]) ?? []
+        let text = parts.compactMap { $0["text"] as? String }.joined(separator: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        var note = text
+        if let r = note.range(of: ". ") { note = String(note[..<r.lowerBound]) }
+        note = MarkdownPlain.plainLinks(note).replacingOccurrences(of: "`", with: "").replacingOccurrences(of: "**", with: "")
+        return note.count > 70 ? String(note.prefix(69)) + "…" : note
+    }
+
+    func askGenie(_ g: GenieRequest, host: String, progress: ((String) -> Void)? = nil) async throws -> (text: String, html: String, markdown: String) {
+        Log.write("GENIE question: \(g.question)")
+        if g.fresh { genieConversationID = nil }
+        if let last = genieLastCall, Date().timeIntervalSince(last) > 300 { genieConversationID = nil }
+        genieLastCall = Date()
+        let convo = g.followUp ? genieConversationID : nil
+        if g.followUp && convo == nil { Log.write("GENIE follow-up requested but no recent conversation, starting a new one") }
+        let convoText = convo ?? "(new conversation)"
+        var token = try await OAuthManager.shared.bearerToken(host: host)
+        var retriedAuth = false
+        for _ in 0..<2 {
+            var r = try request(host, "/api/2.0/genie/one/responses", token: token)
+            r.httpMethod = "POST"
+            r.timeoutInterval = 180
+            r.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+            var body: [String: Any] = ["input": g.question]
+            if let convo { body["conversation_id"] = convo }
+            r.httpBody = try JSONSerialization.data(withJSONObject: body)
+            Self.lastRequestPreview = "POST /api/2.0/genie/one/responses (Genie One)\ninput: \(g.question)\nconversation_id: \(convoText)\n"
+
+            let t0 = Date()
+            let (bytes, resp) = try await Self.genieSession.bytes(for: r)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            if code != 200 {
+                var errText = ""
+                for try await line in bytes.lines {
+                    errText += line + "\n"
+                    if errText.count > 4000 { break }
+                }
+                if code == 401 && !retriedAuth && Settings.shared.authMode == "oauth" {
+                    retriedAuth = true
+                    OAuthManager.shared.invalidateAccessToken()
+                    token = try await OAuthManager.shared.bearerToken(host: host)
+                    continue
+                }
+                if code == 403 && errText.lowercased().contains("genie") {
+                    Log.write("Genie scope not available (HTTP 403): \(errText.prefix(200))")
+                    throw DBError.genieScope
+                }
+                Log.write("GENIE HTTP \(code): \(errText.prefix(200))")
+                throw DBError.http(code, errText)
+            }
+
+            var answer = ""
+            stream: for try await line in bytes.lines {
+                guard line.hasPrefix("data:") else { continue }
+                var payload = String(line.dropFirst(5))
+                if payload.hasPrefix(" ") { payload.removeFirst() }
+                if payload == "[DONE]" { break stream }
+                guard let event = (try? JSONSerialization.jsonObject(with: Data(payload.utf8))) as? [String: Any] else { continue }
+                let type = event["type"] as? String ?? ""
+                let rsp = (event["response"] as? [String: Any]) ?? [:]
+                switch type {
+                case "response.created":
+                    if let cid = rsp["conversation_id"] as? String, !cid.isEmpty {
+                        genieConversationID = cid
+                        let rid = rsp["id"] as? String ?? ""
+                        Log.write("GENIE conversation_id: \(cid) response_id: \(rid)")
+                    }
+                case "response.completed":
+                    answer = Self.genieFinalAnswer(rsp)
+                    break stream
+                case "response.failed", "response.incomplete":
+                    let detail = rsp["error"].map { "\($0)" } ?? (rsp["status"] as? String ?? "")
+                    Log.write("GENIE \(type): \(detail.prefix(200))")
+                    throw DBError.genieFailed(type)
+                case "response.output_item.added", "response.output_item.updated":
+                    let item = (event["item"] as? [String: Any]) ?? [:]
+                    if (item["phase"] as? String) == "commentary", let progress, let note = Self.genieProgressNote(item) {
+                        DispatchQueue.main.async { progress(note) }
+                    }
+                default:
+                    continue
+                }
+            }
+            let plain = MarkdownPlain.convert(answer)
+            guard !plain.isEmpty else { throw DBError.empty }
+            let ms = Int(Date().timeIntervalSince(t0) * 1000)
+            Log.write("GENIE answer (\(plain.count) chars, \(ms) ms): \(plain.prefix(200))")
+            genieLastCall = Date()
+            return (plain, MarkdownPlain.html(answer), answer)
+        }
+        throw DBError.http(401, "Genie rejected the token after a refresh.")
+    }
+}
+EOF
+
 cat > Sources/Bricksper/Auth.swift <<'EOF'
 import Foundation
 import Network
@@ -658,6 +1229,7 @@ final class OAuthManager {
     private var verifier = ""
     private var state = ""
     private var host = ""
+    private var withGenie = true
     private var completion: ((Result<OAuthSession, Error>) -> Void)?
 
     private var redirectURI: String { "http://localhost:\(AuthConfig.redirectPort)" }
@@ -675,9 +1247,10 @@ final class OAuthManager {
         return "✓ Signed in" + (o.email.isEmpty ? "" : " as \(o.email)") + " until \(f.string(from: until))"
     }
 
-    func signIn(host: String, completion: @escaping (Result<OAuthSession, Error>) -> Void) {
+    func signIn(host: String, withGenie: Bool = true, completion: @escaping (Result<OAuthSession, Error>) -> Void) {
         stopListener()
         self.host = host
+        self.withGenie = withGenie
         self.verifier = Self.randomString(64)
         self.state = Self.randomString(24)
         self.completion = completion
@@ -698,7 +1271,7 @@ final class OAuthManager {
             URLQueryItem(name: "state", value: state),
             URLQueryItem(name: "code_challenge", value: Self.challenge(for: verifier)),
             URLQueryItem(name: "code_challenge_method", value: "S256"),
-            URLQueryItem(name: "scope", value: "all-apis offline_access")
+            URLQueryItem(name: "scope", value: withGenie ? "all-apis offline_access genie" : "all-apis offline_access")
         ]
         guard let url = c?.url else { finish(.failure(DBError.badHost)); return }
         NSWorkspace.shared.open(url)
@@ -770,6 +1343,14 @@ final class OAuthManager {
                 Task { @MainActor in await self.exchange(code) }
             } else {
                 let msg = q["error_description"] ?? q["error"] ?? "state mismatch"
+                if self.withGenie && msg.lowercased().contains("scope"), let c = self.completion {
+                    Log.write("Sign-in rejected the genie scope (\(msg)). Retrying with all-apis offline_access only.")
+                    self.respond(conn, status: "200 OK", message: "Retrying sign-in without the Genie scope...")
+                    self.completion = nil
+                    let h = self.host
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.signIn(host: h, withGenie: false, completion: c) }
+                    return
+                }
                 self.respond(conn, status: "200 OK", message: "Sign-in failed: \(msg)")
                 self.finish(.failure(AuthError.denied(msg)))
             }
@@ -856,6 +1437,11 @@ import Carbon.HIToolbox
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onSaved: (() -> Void)?
     var onClose: (() -> Void)?
+    var onGenieTestStart: (() -> Void)?
+    var onGenieTestProgress: ((String) -> Void)?
+    var onGenieTestEnd: (() -> Void)?
+    private var genieTestNote = ""
+    private var genieTestTimer: Timer?
 
     private let hostField = NSTextField()
     private let signInButton = NSButton(title: "Sign in with Databricks", target: nil, action: nil)
@@ -866,7 +1452,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let shortcutButton = NSButton(title: "", target: nil, action: nil)
     private let modelPopup = NSPopUpButton()
     private let customModelField = NSTextField()
+    private let genieCheck = NSButton(checkboxWithTitle: "Enable Genie voice mode (say 'Genie' to ask a data question)", target: nil, action: nil)
     private let saveButton = NSButton(title: "Test & Save", target: nil, action: nil)
+    private let genieTestButton = NSButton(title: "Test Genie", target: nil, action: nil)
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
     private let vocabField = NSTextField()
     private let promptStatus = NSTextField(labelWithString: "")
@@ -876,7 +1464,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var monitor: Any?
 
     init() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 660, height: 620),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 660, height: 660),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = "Bricksper Settings"
         w.isReleasedWhenClosed = false
@@ -907,7 +1495,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             tabs.topAnchor.constraint(equalTo: root.topAnchor, constant: 10),
             tabs.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -10),
             tabs.widthAnchor.constraint(equalToConstant: 640),
-            tabs.heightAnchor.constraint(equalToConstant: 600)
+            tabs.heightAnchor.constraint(equalToConstant: 640)
         ])
         window?.contentView = root
     }
@@ -962,7 +1550,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         hostField.stringValue = s.host
         hostField.widthAnchor.constraint(equalToConstant: 380).isActive = true
 
-        for b in [signInButton, signOutButton, shortcutButton, saveButton] { b.bezelStyle = .rounded }
+        for b in [signInButton, signOutButton, shortcutButton, saveButton, genieTestButton] { b.bezelStyle = .rounded }
         signInButton.target = self
         signInButton.action = #selector(signIn)
         signOutButton.target = self
@@ -987,13 +1575,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         modelPopup.addItem(withTitle: s.model.isEmpty ? "(auto-detected after sign-in)" : s.model); customModelField.placeholderString = "Optional: catalog.schema.service_name"; customModelField.stringValue = s.model.contains(".") ? s.model : ""; customModelField.widthAnchor.constraint(equalToConstant: 380).isActive = true
 
         saveButton.keyEquivalent = "\r"
+        genieCheck.target = self
+        genieCheck.action = #selector(toggleGenie)
+        genieCheck.state = s.genieEnabled ? .on : .off
+
         saveButton.target = self
         saveButton.action = #selector(save)
+        genieTestButton.target = self
+        genieTestButton.action = #selector(testGenie)
 
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.widthAnchor.constraint(equalToConstant: 580).isActive = true
         let hint = NSTextField(wrappingLabelWithString:
-            "1) Enter your workspace URL  2) Click Sign in with Databricks and log in in your browser  3) Done. Sign-in lasts \(Int(AuthConfig.sessionHours)) hours. Sounds: Tink = listening, Pop = released, Glass = pasted.")
+            "1) Enter your workspace URL  2) Click Sign in with Databricks and log in in your browser  3) Done. Sign-in lasts \(Int(AuthConfig.sessionHours)) hours. Sounds: Tink = listening, Pop = released, Glass = pasted. Say 'Genie ...' to ask a data question: purple icon while waiting, Morse = answer pasted. Press the shortcut again to cancel a Genie question.")
         hint.textColor = .tertiaryLabelColor
         hint.font = .systemFont(ofSize: 11)
         hint.widthAnchor.constraint(equalToConstant: 580).isActive = true
@@ -1005,6 +1599,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [label("Push-to-talk shortcut"), shortcutButton],
             [label("Model"), modelPopup],
             [label("Model service"), customModelField],
+            [label("Genie"), genieCheck],
             [label("Advanced"), patCheck],
             [label("Personal access token"), tokenField]
         ])
@@ -1013,7 +1608,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         grid.column(at: 0).xPlacement = .trailing
         grid.rowAlignment = .lastBaseline
 
-        let stack = NSStackView(views: [grid, saveButton, statusLabel, hint])
+        let buttonRow = NSStackView(views: [saveButton, genieTestButton])
+        buttonRow.spacing = 8
+        let stack = NSStackView(views: [grid, buttonRow, statusLabel, hint])
         stack.spacing = 14
         updateAuthUI()
         return stack
@@ -1040,7 +1637,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let (previewScroll, prv) = Self.makeTextScroll(editable: false, height: 150)
         previewView = prv
         previewView.string = DatabricksClient.lastRequestPreview
-        let previewHeader = NSStackView(views: [Self.header("Last request sent to the model"), refresh])
+        let previewHeader = NSStackView(views: [Self.header("Last request sent (model or Genie)"), refresh])
         previewHeader.spacing = 10
 
         let stack = NSStackView(views: [
@@ -1072,6 +1669,52 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         stopRecording()
         onClose?()
+    }
+
+    @objc private func toggleGenie() {
+        Settings.shared.genieEnabled = genieCheck.state == .on
+        statusLabel.stringValue = genieCheck.state == .on ? "Genie voice mode on." : "Genie voice mode off."
+        onSaved?()
+    }
+
+    @objc private func testGenie() {
+        let host = Settings.normalize(hostField.stringValue)
+        guard !host.isEmpty else { statusLabel.stringValue = "Enter your workspace host URL first."; return }
+        statusLabel.stringValue = "Asking Genie (0s): Thinking..."
+        genieTestButton.isEnabled = false
+        let client = DatabricksClient.shared
+        let keepID = client.genieConversationID
+        let keepTime = client.genieLastCall
+        let t0 = Date()
+        genieTestNote = "Thinking..."
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.statusLabel.stringValue = "Asking Genie (\(Int(Date().timeIntervalSince(t0)))s): \(self.genieTestNote)"
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        genieTestTimer = timer
+        onGenieTestStart?()
+        Task { @MainActor in
+            defer {
+                self.genieTestTimer?.invalidate()
+                self.genieTestTimer = nil
+                self.onGenieTestEnd?()
+                client.genieConversationID = keepID
+                client.genieLastCall = keepTime
+                self.genieTestButton.isEnabled = true
+            }
+            do {
+                let q = GenieRequest(question: "How many catalogs can I access? Answer in one short sentence.", followUp: false, fresh: true)
+                let answer = try await client.askGenie(q, host: host, progress: { [weak self] n in
+                    self?.genieTestNote = n
+                    self?.onGenieTestProgress?(n)
+                })
+                let secs = Int(Date().timeIntervalSince(t0))
+                self.statusLabel.stringValue = "✓ Genie replied in \(secs)s: " + String(answer.text.prefix(200))
+            } catch {
+                self.statusLabel.stringValue = "✗ Genie: \(error.localizedDescription)"
+            }
+        }
     }
 
     @objc private func togglePAT() {
@@ -1232,13 +1875,21 @@ cat > Sources/Bricksper/AppDelegate.swift <<'EOF'
 import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    enum State { case idle, listening, thinking }
+    enum State { case idle, listening, thinking, askingGenie }
 
     private var statusItem: NSStatusItem!
     private let hotkeys = HotkeyManager()
     private let speech = SpeechEngine()
     private var settings: SettingsWindowController?
     private var lastText = ""
+    private var lastGenieAnswer = ""
+    private var lastWasGenie = false
+    private var lastGenieHTML = ""
+    private var activeTask: Task<Void, Never>?
+    private var genieNote = ""
+    private var genieStarted = Date()
+    private var genieTimer: Timer?
+    private var testDrivesProgress = false
     private var state: State = .idle { didSet { updateIcon() } }
 
     private func play(_ name: String) {
@@ -1273,6 +1924,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func beginDictation() {
+        if state == .askingGenie { cancelGenie(); return }
         guard state == .idle else { return }
         guard Settings.shared.isConfigured else { openSettings(); return }
         guard SpeechEngine.isAuthorized else {
@@ -1295,8 +1947,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         speech.stop { [weak self] raw in
             guard let self else { return }
             guard !raw.isEmpty else { self.state = .idle; return }
-            Task { @MainActor in
+            self.activeTask = Task { @MainActor in
                 let s = Settings.shared
+                if s.genieEnabled, let g = GenieRouter.detect(raw) {
+                    await self.runGenie(g, host: s.host)
+                    return
+                }
+                let head = raw.split(separator: " ").prefix(3).joined(separator: " ")
+                Log.write(s.genieEnabled ? "GENIE not triggered (transcript starts with: \(head))" : "GENIE disabled, polishing as normal text")
                 var output = raw
                 var usedRaw = false
                 var needsSignIn = false
@@ -1312,13 +1970,111 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if !pasted { self.play("Funk") }
                 else if usedRaw { self.play("Basso") }
                 else { self.play("Glass") }
+                self.lastWasGenie = false
                 self.state = .idle
+                self.buildMenu()
                 if needsSignIn {
-                    self.buildMenu()
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self.openSettings() }
                 }
             }
         }
+    }
+
+    @MainActor
+    private func runGenie(_ g: GenieRequest, host: String) async {
+        state = .askingGenie
+        startGenieProgress()
+        let originPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        var output = g.question
+        var html: String?
+        var usedRaw = false
+        var needsSignIn = false
+        do {
+            let answer = try await DatabricksClient.shared.askGenie(g, host: host, progress: { [weak self] note in self?.genieProgress(note) })
+            let target = PasteTarget.detect()
+            let formatted = PasteFormatter.format(answer.markdown, for: target.kind)
+            Log.write("GENIE paste target: \(target.label) -> \(target.kind.rawValue)")
+            output = formatted.text
+            html = formatted.html
+            lastGenieAnswer = answer.text
+            lastGenieHTML = answer.html
+            lastWasGenie = true
+        } catch {
+            if Task.isCancelled || (error as? URLError)?.code == .cancelled {
+                Log.write("GENIE cancelled by user")
+                stopGenieProgress()
+                play("Bottle")
+                state = .idle
+                buildMenu()
+                return
+            }
+            usedRaw = true
+            needsSignIn = error is AuthError
+            Log.write("Genie failed, pasting raw question: \(error.localizedDescription)")
+        }
+        lastText = output
+        let nowPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let sameApp = originPID == nil || nowPID == originPID
+        if !sameApp {
+            Log.write("GENIE answer copied only: you switched apps while Genie was thinking. Press Cmd+V where you want it.")
+            Paster.copy(output, html: html)
+        }
+        let pasted = sameApp && Paster.paste(output, html: html)
+        if !pasted {
+            play("Funk")
+        } else if usedRaw {
+            play("Basso")
+        } else if NSSound(named: NSSound.Name("Morse")) != nil {
+            play("Morse")
+        } else {
+            play("Purr")
+        }
+        stopGenieProgress()
+        state = .idle
+        buildMenu()
+        if needsSignIn {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self.openSettings() }
+        }
+    }
+
+    private func startGenieProgress() {
+        genieNote = "Thinking..."
+        genieStarted = Date()
+        statusItem.length = NSStatusItem.variableLength
+        statusItem.button?.imagePosition = .imageLeading
+        tickGenie()
+        let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.tickGenie() }
+        RunLoop.main.add(t, forMode: .common)
+        genieTimer = t
+    }
+
+    private func genieProgress(_ note: String) {
+        guard state == .askingGenie, note != genieNote else { return }
+        genieNote = note
+        Log.write("GENIE progress: \(note)")
+        tickGenie()
+    }
+
+    private func tickGenie() {
+        let secs = Int(Date().timeIntervalSince(genieStarted))
+        statusItem.button?.title = " \(secs)s"
+        statusItem.button?.toolTip = "Genie: \(genieNote) (\(secs)s). Press your shortcut again to cancel."
+    }
+
+    private func stopGenieProgress() {
+        genieTimer?.invalidate()
+        genieTimer = nil
+        statusItem.button?.title = ""
+        statusItem.button?.toolTip = nil
+        statusItem.length = NSStatusItem.squareLength
+    }
+
+    @objc private func cancelGenie() {
+        guard state == .askingGenie else { return }
+        Log.write("GENIE cancel requested")
+        genieNote = "Cancelling..."
+        tickGenie()
+        activeTask?.cancel()
     }
 
     private func updateIcon() {
@@ -1329,6 +2085,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .idle:      name = "mic";             tint = nil
         case .listening: name = "mic.fill";        tint = .systemRed
         case .thinking:  name = "ellipsis.circle"; tint = .systemBlue
+        case .askingGenie: name = "sparkles"; tint = .systemPurple
         }
         button.image = NSImage(systemSymbolName: name, accessibilityDescription: "Bricksper")
         button.contentTintColor = tint
@@ -1336,9 +2093,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildMenu() {
         let menu = NSMenu()
+        menu.delegate = self
+        populate(menu)
+        statusItem.menu = menu
+    }
+
+    private func populate(_ menu: NSMenu) {
+        menu.removeAllItems()
         let hint = NSMenuItem(title: "Hold \(Settings.shared.hotkey.display) to dictate", action: nil, keyEquivalent: "")
         hint.isEnabled = false
         menu.addItem(hint)
+        if state == .askingGenie {
+            let secs = Int(Date().timeIntervalSince(genieStarted))
+            let gp = NSMenuItem(title: "Genie (\(secs)s): \(genieNote)", action: nil, keyEquivalent: "")
+            gp.isEnabled = false
+            menu.addItem(gp)
+            menu.addItem(item("Cancel Genie Question", #selector(cancelGenie)))
+        }
         let auth = NSMenuItem(title: OAuthManager.statusText(), action: nil, keyEquivalent: "")
         auth.isEnabled = false
         menu.addItem(auth)
@@ -1347,6 +2118,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             mi.isEnabled = false
             menu.addItem(mi)
         }
+        let gi = NSMenuItem(title: Settings.shared.genieEnabled ? "Genie: enabled" : "Genie: disabled", action: nil, keyEquivalent: "")
+        gi.isEnabled = false
+        menu.addItem(gi)
         if Paster.hasAccessibility {
             let ax = NSMenuItem(title: "Auto-paste: on", action: nil, keyEquivalent: "")
             ax.isEnabled = false
@@ -1356,11 +2130,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         menu.addItem(.separator())
         menu.addItem(item("Paste Last Result", #selector(pasteLast)))
+        if lastWasGenie && !lastGenieAnswer.isEmpty {
+            menu.addItem(item("Paste Last Genie Answer", #selector(pasteLastGenie)))
+        }
         menu.addItem(item("Settings...", #selector(openSettings), ","))
         menu.addItem(item("Open Log", #selector(openLog)))
         menu.addItem(.separator())
         menu.addItem(item("Quit Bricksper", #selector(NSApplication.terminate(_:)), "q", target: NSApp))
-        statusItem.menu = menu
     }
 
     private func item(_ title: String, _ action: Selector, _ key: String = "", target: AnyObject? = nil) -> NSMenuItem {
@@ -1370,9 +2146,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func pasteLast() { if !lastText.isEmpty { Paster.paste(lastText) } }
+    @objc private func pasteLastGenie() { if !lastGenieAnswer.isEmpty { Paster.paste(lastGenieAnswer, html: lastGenieHTML) } }
     @objc private func grantAX() { Paster.promptAccessibility() }
     @objc private func openLog() {
-        if !FileManager.default.fileExists(atPath: Log.url.path) { Log.write("Log created.") }
+        Log.ensureExists()
         NSWorkspace.shared.open(Log.url)
     }
 
@@ -1381,6 +2158,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if settings == nil {
             let c = SettingsWindowController()
             c.onSaved = { [weak self] in self?.buildMenu() }
+            c.onGenieTestStart = { [weak self] in
+                guard let self, self.state == .idle else { return }
+                self.testDrivesProgress = true
+                self.state = .askingGenie
+                self.startGenieProgress()
+            }
+            c.onGenieTestProgress = { [weak self] n in self?.genieProgress(n) }
+            c.onGenieTestEnd = { [weak self] in
+                guard let self, self.testDrivesProgress else { return }
+                self.testDrivesProgress = false
+                self.stopGenieProgress()
+                self.state = .idle
+            }
             c.onClose = { [weak self] in
                 guard let self else { return }
                 self.hotkeys.register(Settings.shared.hotkey)
@@ -1412,6 +2202,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         a.messageText = title
         a.informativeText = message
         a.runModal()
+    }
+}
+
+extension AppDelegate: NSMenuDelegate {
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        populate(menu)
     }
 }
 EOF
@@ -1453,9 +2249,14 @@ cat <<MSG
        pkill -x $APP_NAME; open -a $APP_NAME
  4. Hold your shortcut, speak, release: text pastes at the cursor.
     Tink = listening, Pop = released, Glass = pasted.
+ 5. Genie voice mode: start with "Genie ..." to ask a data question.
+    Say "follow up" or "and also" after Genie to continue the last
+    conversation, or "new question" to start fresh.
+    Purple icon = asking Genie, Morse = Genie answer pasted.
+    Upgrading from v1.2? Sign out and sign in once so the token
+    includes the genie scope.
  Sign-in lasts $SESSION_HOURS hours; Bricksper asks you to sign in again after that.
 
  Log:        ~/Library/Logs/$APP_NAME.log
  Uninstall:  bash $0 --uninstall
 MSG
-bash ./install_bricksper.sh
