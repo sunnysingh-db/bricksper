@@ -16,6 +16,7 @@ Bricksper is a Mac menu-bar app that turns your voice into clean, well-punctuate
 - **Never loses your words:** if the model is unavailable, your raw text is pasted instead.
 - **Genie voice mode (new in v1.3):** say *"Genie, which city had the most late deliveries in October 2026?"* and the answer is pasted where you are typing, with follow-up questions that remember the conversation.
 - **Right format for every app (new):** Genie answers paste as real tables in Google Docs, Word and Gmail, as cells in Sheets and Excel, as a slide outline in Slides and PowerPoint, and as Slack-style text in Slack. Links stay clickable.
+- **Automatic charts (new):** when Genie answers with a table that suits a chart, your own model (through Unity Gateway) picks a bar, line or donut chart and writes an insight title. Bricksper draws it on your Mac and pastes it with the answer.
 - **Live progress (new):** a seconds counter and Genie's latest step show in the menu bar while it works. Press the shortcut again to cancel.
 - **Keeps your clipboard:** whatever you had copied (text, images, files) is restored after each paste.
 - **Sound cues:** see [Sounds](#-sounds).
@@ -51,7 +52,7 @@ Bricksper is a Mac menu-bar app that turns your voice into clean, well-punctuate
 ```
 
 - **Dictation:** `POST /serving-endpoints/{model}/invocations`, or `/ai-gateway/mlflow/v1/chat/completions` for Unity Gateway model services (`catalog.schema.name`).
-- **Genie:** `POST /api/2.0/genie/one/responses`, streamed back as server-sent events.
+- **Genie:** the generally available **Genie One MCP server** `system.ai.genie_one_mcp`, called through Unity Gateway at `/ai-gateway/mcp-services/system.ai.genie_one_mcp?o=<workspace-id>` (`genie_ask`, then `genie_poll_response` until the answer is ready). If that is refused, Bricksper falls back to the Beta REST API `POST /api/2.0/genie/one/responses`.
 
 ---
 
@@ -84,7 +85,7 @@ pkill -x Bricksper; open -a Bricksper
 
 **7. Try Genie.** In **Settings → Connection**, click **Test Genie**. Then click into a Google Doc, hold **⌥ Space** and say *"Genie, how many catalogs can I access?"*
 
-> **Upgrading from v1.2?** Run the installer again, then **Sign out** and **Sign in with Databricks** once so your sign-in includes Genie access. Reinstalls are now faster because the build cache is kept.
+> **Upgrading from v1.2?** Run the installer again, then **Sign out** and **Sign in with Databricks** once so your sign-in includes the `ai-gateway` scope that Genie needs. Reinstalls are now faster because the build cache is kept.
 
 ---
 
@@ -120,6 +121,19 @@ Start your dictation with **"Genie"** and Bricksper sends your question to **Dat
 
 Genie's internal citations ("Query Result", source footnotes) are removed in every format. **🎙 → Paste Last Genie Answer** pastes the last answer again in rich-text format.
 
+**Automatic charts:**
+
+When a Genie answer contains a table, Bricksper sends only the column names and up to 20 rows to the model you chose for dictation and asks it for the best chart, the columns to use, a one-line insight title and which bar to highlight. If the model is unavailable or its choice doesn't fit the table, built-in rules decide instead (dates → line, categories → bar, shares of a whole → donut, otherwise no chart). The chart is drawn on your Mac, so query results never go to a chart service.
+
+| Where your cursor is | Chart behaviour |
+|---|---|
+| Google Docs, Word, Gmail, Teams | Chart image inserted above the table |
+| Google Slides, PowerPoint, Keynote | Only the chart image is pasted (the title is in the image) |
+| Slack | Text answer first, then the chart is pasted as an image attachment |
+| Google Sheets, Excel, Terminal, code editors | No chart: the table only, so you can build a native chart |
+
+Charts add about 2 seconds. Turn them off with **Settings → Connection → Turn Genie tables into charts**. The log shows `CHART bar chosen by model: …` or why a chart was skipped.
+
 **Tips for good, fast answers:**
 
 - Name the business area and a fixed time period, for example *"in October 2026"*, rather than *"last 30 days"*.
@@ -144,7 +158,7 @@ Bricksper uses Databricks **OAuth user-to-machine (U2M)** sign-in, so you never 
 **Good to know:**
 
 - You act as **yourself**, so Bricksper can only use the models and data your Databricks permissions allow.
-- Bricksper asks for the scopes `all-apis offline_access genie`. If your workspace rejects the `genie` scope, it signs in again automatically without it (dictation keeps working, Genie does not).
+- Bricksper asks for the scopes `all-apis offline_access ai-gateway genie`: `ai-gateway` for the Genie One MCP server and `genie` for the Beta REST fallback. If your workspace rejects a scope, Bricksper signs in again automatically with fewer scopes (first without `genie`, then without both). Dictation keeps working either way.
 - **Settings → Connection** and the menu bar show **"✓ Signed in as you@company.com until …"**. Click **Sign out** to end the session at any time.
 - **Admins:** by default Bricksper uses the built-in `databricks-cli` client ID. For an organization-wide rollout, register your own OAuth app and set `CLIENT_ID` at the top of `install_bricksper.sh`.
 - **Fallback:** if your workspace doesn't allow browser sign-in, tick **Advanced → Use a personal access token** in Settings.
@@ -199,10 +213,13 @@ Open **🎙 → Settings… → Prompt** to control how your speech is polished.
 | Words are missing or the output looks odd | Click 🎙 → **Open Log** to see what was heard and what the model returned. |
 | Said "Genie…" but it was dictated as normal text | Make "Genie" the first word (greetings like "Hi" are fine). The log shows `GENIE not triggered (transcript starts with: …)`, which tells you what the Mac heard. Also check that **Genie: enabled** shows in the menu. |
 | Genie answer is your question pasted back (Basso) | The log says why. `Genie scope not available` means you should **Sign out** and **Sign in** again; on some workspaces Genie One may not be enabled. |
+| Test Genie shows "Genie is not reachable in this workspace" | Bricksper tried both the Genie One MCP server and the Beta REST API. First **Sign out** and **Sign in with Databricks** so your sign-in includes the `ai-gateway` scope. If it still fails, ask an admin to check that you can use `system.ai.genie_one_mcp` (**Unity Gateway → MCPs**) and have **CAN USE** on a SQL warehouse. The log shows `GENIE MCP HTTP …` with the exact reason. Dictation keeps working either way. |
 | Genie takes a long time | 20 to 45 seconds is normal. Watch the counter on the icon, or press the shortcut again to cancel. Narrow questions with a fixed date range are fastest. |
 | Genie answer was copied, not pasted (Funk) | You switched apps while Genie was thinking. Press ⌘V where you want the answer. |
 | Slack shows raw `*` or backticks | Turn on **Slack → Preferences → Advanced → Format messages with markup**. |
 | Table pasted as plain text in Google Docs | Press ⌘V (not ⌘⇧V, which pastes without formatting). |
+| No chart appeared | Open the log: `CHART skipped` means the model (or the rules) decided a chart would not help, for example a single row or text-only columns. Also check that **Turn Genie tables into charts** is ticked and the cursor isn't in Sheets, Excel or a code editor. |
+| Chart missing in Word or Teams but the table pasted | Some apps ignore images embedded in pasted rich text. Use **🎙 → Paste Last Genie Answer** in Google Docs, or paste the answer into Slides, where the chart is pasted as a plain image. |
 | Shortcut does nothing after you changed it | Another app may use the same keys. The log shows `Shortcut … could not be registered`; pick a different shortcut. |
 
 **Log file:** `~/Library/Logs/Bricksper.log`, rotated to `Bricksper.old.log` at 5 MB. It records what was heard, what was pasted and every Genie step.

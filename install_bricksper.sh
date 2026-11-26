@@ -159,6 +159,10 @@ final class Settings {
         get { d.stringArray(forKey: "vocabulary") ?? ["Databricks", "Unity Catalog", "Lakebase", "Genie", "PySpark", "Delta Lake", "SQL", "Lakeflow", "MLflow"] }
         set { d.set(newValue, forKey: "vocabulary") }
     }
+    var chartsEnabled: Bool {
+        get { d.object(forKey: "chartsEnabled") as? Bool ?? true }
+        set { d.set(newValue, forKey: "chartsEnabled") }
+    }
     var genieEnabled: Bool {
         get { d.object(forKey: "genieEnabled") as? Bool ?? true }
         set { d.set(newValue, forKey: "genieEnabled") }
@@ -368,6 +372,27 @@ enum Paster {
         pb.setString(text, forType: .string)
     }
 
+    @discardableResult
+    static func pasteImage(_ png: Data) -> Bool {
+        let pb = NSPasteboard.general
+        let saved = snapshot(pb)
+        pb.clearContents()
+        pb.setData(png, forType: .png)
+        if let tiff = NSImage(data: png)?.tiffRepresentation { pb.setData(tiff, forType: .tiff) }
+        let ourChange = pb.changeCount
+        guard hasAccessibility else { return false }
+        waitForModifiersReleased {
+            sendCmdV()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                if pb.changeCount == ourChange, !saved.isEmpty {
+                    pb.clearContents()
+                    pb.writeObjects(saved)
+                }
+            }
+        }
+        return true
+    }
+
     private static func snapshot(_ pb: NSPasteboard) -> [NSPasteboardItem] {
         (pb.pasteboardItems ?? []).map { item in
             let clone = NSPasteboardItem()
@@ -463,7 +488,7 @@ enum Log {
 }
 
 enum DBError: LocalizedError {
-    case badHost, http(Int, String), empty, noModel, truncated, tooShort, genieScope, genieFailed(String)
+    case badHost, http(Int, String), empty, noModel, truncated, tooShort, genieScope, genieFailed(String), genieUnavailable
     var errorDescription: String? {
         switch self {
         case .badHost: return "Host URL is not valid."
@@ -474,6 +499,7 @@ enum DBError: LocalizedError {
         case .tooShort: return "The model dropped too much text (raw text used)."
         case .genieScope: return "Genie scope not available for this sign-in (raw question pasted). Sign out and sign in again."
         case .genieFailed(let t): return "Genie did not finish (\(t)); raw question pasted."
+        case .genieUnavailable: return "Genie is not reachable in this workspace. Bricksper tried the Genie One MCP server (Unity Gateway) and the Genie One API (Beta, HTTP 404). Sign out and sign in again so your sign-in includes the ai-gateway scope. If it still fails, ask an admin to check your access to system.ai.genie_one_mcp under Unity Gateway > MCPs, and that you can use a SQL warehouse."
         }
     }
 }
@@ -918,7 +944,7 @@ extension MarkdownPlain {
     }
 
     static func dropCitations(_ md: String) -> String {
-        sub(md, #"[ \t]*(Query Result[ \t]*)?\[[^\]]*\]\(#source-[^)]*\)"#, "")
+        sub(md, #"[ \t]*(Query Result[ \t]*)?\[[^\]]*\]\((#source-|[^)\s]*#(embed|memory)-)[^)]*\)"#, "")
     }
 }
 
@@ -1116,6 +1142,133 @@ extension DatabricksClient {
         return note.count > 70 ? String(note.prefix(69)) + "…" : note
     }
 
+    static func genieStepNote(_ step: String) -> String? {
+        var t = step.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.hasPrefix("Thinking:") { t = String(t.dropFirst(9)).trimmingCharacters(in: .whitespaces) }
+        return genieProgressNote(["content": [["text": t]]])
+    }
+
+    private struct MCPError: Error {
+        let code: Int
+        let body: String
+    }
+
+    private static var orgIDs: [String: String] = [:]
+
+    private func workspaceID(host: String, token: String) async throws -> String {
+        if let id = Self.orgIDs[host] { return id }
+        let r = try request(host, "/api/2.0/preview/scim/v2/Me", token: token)
+        let (_, resp) = try await Self.genieSession.data(for: r)
+        if let id = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "x-databricks-org-id"), !id.isEmpty {
+            Self.orgIDs[host] = id
+            return id
+        }
+        if let h = URL(string: host)?.host, h.hasPrefix("adb-"), let part = h.dropFirst(4).split(separator: ".").first, !part.isEmpty {
+            Self.orgIDs[host] = String(part)
+            return String(part)
+        }
+        throw MCPError(code: 404, body: "Could not determine the workspace ID for \(host)")
+    }
+
+    private func mcpCall(_ url: URL, token: String, sessionID: String?, method: String, params: [String: Any]?, id: Int?) async throws -> (result: [String: Any], sessionID: String?) {
+        var r = URLRequest(url: url)
+        r.httpMethod = "POST"
+        r.timeoutInterval = 60
+        r.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        r.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
+        if let sessionID { r.setValue(sessionID, forHTTPHeaderField: "Mcp-Session-Id") }
+        var body: [String: Any] = ["jsonrpc": "2.0", "method": method]
+        if let params { body["params"] = params }
+        if let id { body["id"] = id }
+        r.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, resp) = try await Self.genieSession.data(for: r)
+        let http = resp as? HTTPURLResponse
+        let code = http?.statusCode ?? 0
+        let text = String(data: data, encoding: .utf8) ?? ""
+        let sid = http?.value(forHTTPHeaderField: "Mcp-Session-Id") ?? sessionID
+        guard (200...299).contains(code) else { throw MCPError(code: code, body: text) }
+        if id == nil { return ([:], sid) }
+        var payload = text
+        if (http?.value(forHTTPHeaderField: "Content-Type") ?? "").contains("event-stream") {
+            let dataLines = text.components(separatedBy: "\n").filter { $0.hasPrefix("data:") }
+            payload = dataLines.last.map { String($0.dropFirst(5)).trimmingCharacters(in: .whitespaces) } ?? ""
+        }
+        guard let obj = (try? JSONSerialization.jsonObject(with: Data(payload.utf8))) as? [String: Any] else { throw DBError.empty }
+        if let err = obj["error"] as? [String: Any] {
+            throw MCPError(code: (err["code"] as? Int) ?? -1, body: (err["message"] as? String) ?? "\(err)")
+        }
+        return ((obj["result"] as? [String: Any]) ?? [:], sid)
+    }
+
+    private func mcpTool(_ url: URL, token: String, sid: String?, name: String, args: [String: Any], id: Int) async throws -> [String: Any] {
+        let res = try await mcpCall(url, token: token, sessionID: sid, method: "tools/call", params: ["name": name, "arguments": args], id: id).result
+        if (res["isError"] as? Bool) == true {
+            let parts = (res["content"] as? [[String: Any]]) ?? []
+            let msg = parts.compactMap { $0["text"] as? String }.joined(separator: " ")
+            throw DBError.genieFailed(String(msg.prefix(200)))
+        }
+        return (res["structuredContent"] as? [String: Any]) ?? [:]
+    }
+
+    private func askGenieMCP(_ g: GenieRequest, host: String, convo: String?, token: String, progress: ((String) -> Void)?) async throws -> String {
+        let org = try await workspaceID(host: host, token: token)
+        var comps = URLComponents(string: host + "/ai-gateway/mcp-services/system.ai.genie_one_mcp")
+        comps?.queryItems = [URLQueryItem(name: "o", value: org)]
+        guard let url = comps?.url else { throw DBError.badHost }
+        let initParams: [String: Any] = [
+            "protocolVersion": "2025-06-18",
+            "capabilities": [String: Any](),
+            "clientInfo": ["name": "Bricksper", "version": "1.3"]
+        ]
+        let started = try await mcpCall(url, token: token, sessionID: nil, method: "initialize", params: initParams, id: 1)
+        let sid = started.sessionID
+        _ = try? await mcpCall(url, token: token, sessionID: sid, method: "notifications/initialized", params: nil, id: nil)
+        var args: [String: Any] = ["question": g.question]
+        if let convo { args["conversation_id"] = convo }
+        let convoText = convo ?? "(new conversation)"
+        Self.lastRequestPreview = "MCP system.ai.genie_one_mcp (Unity Gateway) -> genie_ask\nquestion: \(g.question)\nconversation_id: \(convoText)\n"
+        var state = try await mcpTool(url, token: token, sid: sid, name: "genie_ask", args: args, id: 2)
+        guard let cid = state["conversation_id"] as? String, let rid = state["response_id"] as? String else { throw DBError.empty }
+        genieConversationID = cid
+        Log.write("GENIE conversation_id: \(cid) response_id: \(rid) (MCP)")
+        var lastStep = ""
+        var n = 3
+        let deadline = Date().addingTimeInterval(180)
+        while (state["status"] as? String) == "in_progress" {
+            if Date() > deadline { throw DBError.genieFailed("timed out after 180 s") }
+            do {
+                try await Task.sleep(nanoseconds: 1_500_000_000)
+            } catch {
+                let cancelID = n
+                Task.detached { [self] in
+                    _ = try? await self.mcpTool(url, token: token, sid: sid, name: "genie_cancel_response", args: ["conversation_id": cid, "response_id": rid], id: cancelID)
+                }
+                throw error
+            }
+            state = try await mcpTool(url, token: token, sid: sid, name: "genie_poll_response", args: ["conversation_id": cid, "response_id": rid], id: n)
+            n += 1
+            if let steps = state["progress_steps"] as? [Any], let last = steps.last.map({ "\($0)" }), last != lastStep {
+                lastStep = last
+                if let progress, let note = Self.genieStepNote(last) { DispatchQueue.main.async { progress(note) } }
+            }
+        }
+        let status = state["status"] as? String ?? ""
+        let answer = state["final_answer"] as? String ?? ""
+        if status == "completed" || (status == "incomplete" && !answer.isEmpty) { return answer }
+        Log.write("GENIE MCP status \(status)")
+        throw DBError.genieFailed(status)
+    }
+
+    private func finishGenie(_ answer: String, t0: Date) throws -> (text: String, html: String, markdown: String) {
+        let plain = MarkdownPlain.convert(answer)
+        guard !plain.isEmpty else { throw DBError.empty }
+        let ms = Int(Date().timeIntervalSince(t0) * 1000)
+        Log.write("GENIE answer (\(plain.count) chars, \(ms) ms): \(plain.prefix(200))")
+        genieLastCall = Date()
+        return (plain, MarkdownPlain.html(answer), answer)
+    }
+
     func askGenie(_ g: GenieRequest, host: String, progress: ((String) -> Void)? = nil) async throws -> (text: String, html: String, markdown: String) {
         Log.write("GENIE question: \(g.question)")
         if g.fresh { genieConversationID = nil }
@@ -1123,6 +1276,32 @@ extension DatabricksClient {
         genieLastCall = Date()
         let convo = g.followUp ? genieConversationID : nil
         if g.followUp && convo == nil { Log.write("GENIE follow-up requested but no recent conversation, starting a new one") }
+        let t0 = Date()
+        var token = try await OAuthManager.shared.bearerToken(host: host)
+        var answer = ""
+        var useREST = false
+        for attempt in 0..<2 {
+            do {
+                answer = try await askGenieMCP(g, host: host, convo: convo, token: token, progress: progress)
+                break
+            } catch let e as MCPError {
+                if e.code == 401 && attempt == 0 && Settings.shared.authMode == "oauth" {
+                    OAuthManager.shared.invalidateAccessToken()
+                    token = try await OAuthManager.shared.bearerToken(host: host)
+                    continue
+                }
+                Log.write("GENIE MCP HTTP \(e.code): \(e.body.prefix(200)). Falling back to the Genie One REST API.")
+                useREST = true
+                break
+            }
+        }
+        if useREST {
+            return try await askGenieREST(g, host: host, convo: convo, progress: progress)
+        }
+        return try finishGenie(answer, t0: t0)
+    }
+
+    func askGenieREST(_ g: GenieRequest, host: String, convo: String?, progress: ((String) -> Void)? = nil) async throws -> (text: String, html: String, markdown: String) {
         let convoText = convo ?? "(new conversation)"
         var token = try await OAuthManager.shared.bearerToken(host: host)
         var retriedAuth = false
@@ -1150,6 +1329,10 @@ extension DatabricksClient {
                     OAuthManager.shared.invalidateAccessToken()
                     token = try await OAuthManager.shared.bearerToken(host: host)
                     continue
+                }
+                if code == 404 && errText.lowercased().contains("genie") {
+                    Log.write("Genie One not available in this workspace (HTTP 404): \(errText.prefix(200))")
+                    throw DBError.genieUnavailable
                 }
                 if code == 403 && errText.lowercased().contains("genie") {
                     Log.write("Genie scope not available (HTTP 403): \(errText.prefix(200))")
@@ -1203,6 +1386,392 @@ extension DatabricksClient {
 }
 EOF
 
+cat > Sources/Bricksper/Charts.swift <<'EOF'
+import Foundation
+import AppKit
+
+struct ChartSpec {
+    var type: String
+    var x: Int
+    var y: Int
+    var title: String
+    var highlight: String?
+}
+
+struct ChartTable {
+    var header: [String]
+    var rows: [[String]]
+}
+
+enum ChartAdvisor {
+    static let timeWords = ["date", "month", "week", "day", "year", "quarter", "period", "time"]
+
+    static func firstTable(_ md: String) -> ChartTable? {
+        var lines: [String] = []
+        var started = false
+        for raw in md.components(separatedBy: "\n") {
+            let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if t.hasPrefix("|") && t.count > 1 {
+                lines.append(t)
+                started = true
+            } else if started {
+                break
+            }
+        }
+        let body = lines.filter { !MarkdownPlain.isSeparator($0) }
+        guard body.count >= 3 else { return nil }
+        let parsed = body.map { MarkdownPlain.cells($0).map(Self.clean) }
+        let header = parsed[0]
+        let data = Array(parsed.dropFirst()).filter { $0.count == header.count }
+        guard header.count >= 2, data.count >= 2 else { return nil }
+        return ChartTable(header: header, rows: data)
+    }
+
+    static func clean(_ s: String) -> String {
+        var l = MarkdownPlain.plainLinks(s)
+        l = MarkdownPlain.sub(l, #"\\([\\`*_{}\[\]()#+.!|~>-])"#, "$1")
+        return l.replacingOccurrences(of: "**", with: "").replacingOccurrences(of: "`", with: "").trimmingCharacters(in: .whitespaces)
+    }
+
+    static func number(_ s: String) -> Double? {
+        var t = s.replacingOccurrences(of: ",", with: "").replacingOccurrences(of: "~", with: "")
+            .replacingOccurrences(of: "%", with: "").replacingOccurrences(of: "$", with: "")
+            .replacingOccurrences(of: "₹", with: "").replacingOccurrences(of: "Rs", with: "")
+            .trimmingCharacters(in: .whitespaces)
+        var mult = 1.0
+        if let last = t.last {
+            let u = last.uppercased()
+            if u == "K" || u == "M" || u == "B" {
+                mult = u == "K" ? 1e3 : (u == "M" ? 1e6 : 1e9)
+                t.removeLast()
+            }
+        }
+        guard !t.isEmpty, let v = Double(t) else { return nil }
+        return v * mult
+    }
+
+    static func isDateLike(_ s: String) -> Bool {
+        s.range(of: #"^(\d{4}-\d{2}(-\d{2})?|q[1-4]\b.*|(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b.*|w(ee)?k\s?\d+.*)$"#, options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
+    static func humanize(_ s: String) -> String {
+        let t = s.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespaces)
+        return String(t.prefix(1)).uppercased() + String(t.dropFirst())
+    }
+
+    static func percentMode(_ header: String, _ values: [Double]) -> Int {
+        let h = header.lowercased()
+        guard ["rate", "pct", "percent", "share", "%"].contains(where: { h.contains($0) }) else { return 0 }
+        return values.allSatisfy { abs($0) <= 1 } ? 1 : 2
+    }
+
+    static func rules(_ t: ChartTable) -> ChartSpec? {
+        let n = t.rows.count
+        guard n >= 2, n <= 40 else { return nil }
+        func isNumeric(_ c: Int) -> Bool { t.rows.allSatisfy { number($0[c]) != nil } }
+        func isTime(_ c: Int) -> Bool {
+            let h = t.header[c].lowercased()
+            if timeWords.contains(where: { h.contains($0) }) { return true }
+            return t.rows.allSatisfy { isDateLike($0[c]) }
+        }
+        let cols = Array(0..<t.header.count)
+        guard let x = cols.first(where: { isTime($0) }) ?? cols.first(where: { !isNumeric($0) }) else { return nil }
+        guard let y = cols.first(where: { $0 != x && isNumeric($0) && !isTime($0) }) else { return nil }
+        let values = t.rows.compactMap { number($0[y]) }
+        let total = values.reduce(0, +)
+        let yName = t.header[y].lowercased()
+        let shareName = ["share", "pct", "percent", "%"].contains(where: { yName.contains($0) })
+        var type = ""
+        if isTime(x) {
+            type = "line"
+        } else if n <= 6 && shareName && ((total > 95 && total < 105) || (total > 0.95 && total < 1.05)) {
+            type = "pie"
+        } else if n <= 15 {
+            type = "bar"
+        } else {
+            return nil
+        }
+        return ChartSpec(type: type, x: x, y: y, title: humanize(t.header[y]) + " by " + humanize(t.header[x]), highlight: nil)
+    }
+
+    static func llm(_ t: ChartTable, question: String) async -> ChartSpec? {
+        let s = Settings.shared
+        guard !s.host.isEmpty, !s.model.isEmpty else { return nil }
+        let sample = t.rows.prefix(20).map { $0.joined(separator: " | ") }.joined(separator: "\n")
+        let columns = t.header.joined(separator: " | ")
+        let prompt = """
+        You pick the best chart for a data table that answers a business question. Reply with ONLY one JSON object and nothing else:
+        {"type": "bar" or "line" or "pie" or "none", "x": "<exact column name for the labels>", "y": "<exact column name of a numeric column>", "title": "<short title that states the insight, max 60 characters>", "highlight": "<one label to emphasize, or empty>"}
+        Rules: "line" only when x is a time or date column. "pie" only for shares of one whole with 6 rows or fewer. "bar" to compare categories. "none" when a chart would not add anything (for example a single row or mostly text).
+
+        Question: \(question)
+        Columns: \(columns)
+        Rows:
+        \(sample)
+        """
+        let reply: String
+        do {
+            reply = try await DatabricksClient.shared.chartAdvice(prompt, host: s.host, model: s.model)
+        } catch {
+            Log.write("CHART model advice unavailable, using rules: \(error.localizedDescription)")
+            return nil
+        }
+        guard let a = reply.firstIndex(of: "{"), let b = reply.lastIndex(of: "}"), a < b,
+              let obj = (try? JSONSerialization.jsonObject(with: Data(reply[a...b].utf8))) as? [String: Any] else {
+            Log.write("CHART model reply was not JSON, using rules")
+            return nil
+        }
+        let type = (obj["type"] as? String ?? "").lowercased()
+        if type == "none" { return ChartSpec(type: "none", x: 0, y: 0, title: "", highlight: nil) }
+        guard ["bar", "line", "pie"].contains(type),
+              let xi = t.header.firstIndex(of: obj["x"] as? String ?? ""),
+              let yi = t.header.firstIndex(of: obj["y"] as? String ?? ""), xi != yi,
+              t.rows.allSatisfy({ number($0[yi]) != nil }) else {
+            Log.write("CHART model picked columns that do not fit the table, using rules")
+            return nil
+        }
+        let title = (obj["title"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let hl = (obj["highlight"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let finalTitle = title.isEmpty ? humanize(t.header[yi]) + " by " + humanize(t.header[xi]) : String(title.prefix(70))
+        return ChartSpec(type: type, x: xi, y: yi, title: finalTitle, highlight: hl)
+    }
+}
+
+extension DatabricksClient {
+    private static let chartSession: URLSession = {
+        let c = URLSessionConfiguration.default
+        c.timeoutIntervalForRequest = 10
+        return URLSession(configuration: c)
+    }()
+
+    func chartAdvice(_ prompt: String, host: String, model: String) async throws -> String {
+        let token = try await OAuthManager.shared.bearerToken(host: host)
+        let isService = model.contains(".")
+        var r = try request(host, isService ? "/ai-gateway/mlflow/v1/chat/completions" : "/serving-endpoints/\(model)/invocations", token: token)
+        r.httpMethod = "POST"
+        r.timeoutInterval = 10
+        var body: [String: Any] = ["messages": [["role": "user", "content": prompt]]]
+        if isService { body["model"] = model }
+        r.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, resp) = try await Self.chartSession.data(for: r)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 200 else { throw DBError.http(code, String(data: data, encoding: .utf8) ?? "") }
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let choices = json["choices"] as? [[String: Any]],
+              let msg = choices.first?["message"] as? [String: Any] else { throw DBError.empty }
+        if let s = msg["content"] as? String { return s }
+        if let parts = msg["content"] as? [[String: Any]] {
+            return parts.filter { ($0["type"] as? String) == "text" }.compactMap { $0["text"] as? String }.joined()
+        }
+        throw DBError.empty
+    }
+}
+
+enum ChartRenderer {
+    static let width = 1600
+    static let height = 900
+    static let accent = NSColor(srgbRed: 1.0, green: 0.212, blue: 0.129, alpha: 1)
+    static let ink = NSColor(srgbRed: 0.106, green: 0.192, blue: 0.224, alpha: 1)
+    static let muted = NSColor(srgbRed: 0.56, green: 0.63, blue: 0.68, alpha: 1)
+    static let grid = NSColor(white: 0.9, alpha: 1)
+
+    static func png(_ spec: ChartSpec, labels: [String], values: [Double], percent: Int) -> Data? {
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+              let ctx = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ctx
+        let w = CGFloat(width)
+        let h = CGFloat(height)
+        NSColor.white.setFill()
+        NSRect(x: 0, y: 0, width: w, height: h).fill()
+        text(spec.title, at: NSPoint(x: 60, y: h - 100), size: 44, weight: .bold, color: ink)
+        text("Source: Databricks Genie", at: NSPoint(x: 60, y: 28), size: 22, weight: .regular, color: muted)
+        let plot = NSRect(x: 60, y: 90, width: w - 120, height: h - 230)
+        switch spec.type {
+        case "line": drawLine(labels, values, in: plot, percent: percent)
+        case "pie": drawPie(labels, values, in: plot)
+        default: drawBars(labels, values, in: plot, highlight: spec.highlight, percent: percent)
+        }
+        ctx.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+        return rep.representation(using: .png, properties: [:])
+    }
+
+    static func fmt(_ v: Double, _ percent: Int) -> String {
+        if percent == 1 { return String(format: "%.1f%%", v * 100) }
+        if percent == 2 { return String(format: "%.1f%%", v) }
+        let a = abs(v)
+        if a >= 1e9 { return String(format: "%.1fB", v / 1e9) }
+        if a >= 1e6 { return String(format: "%.1fM", v / 1e6) }
+        if a >= 1e4 || v == v.rounded() {
+            let f = NumberFormatter()
+            f.numberStyle = .decimal
+            f.maximumFractionDigits = 0
+            return f.string(from: NSNumber(value: v)) ?? String(Int(v))
+        }
+        return String(format: "%.2f", v)
+    }
+
+    private static func short(_ s: String, _ n: Int) -> String {
+        s.count > n ? String(s.prefix(n - 1)) + "…" : s
+    }
+
+    private static func text(_ s: String, at p: NSPoint, size: CGFloat, weight: NSFont.Weight, color: NSColor, align: NSTextAlignment = .left) {
+        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: size, weight: weight), .foregroundColor: color]
+        let str = s as NSString
+        var origin = p
+        if align != .left {
+            let tw = str.size(withAttributes: attrs).width
+            origin.x = align == .right ? p.x - tw : p.x - tw / 2
+        }
+        str.draw(at: origin, withAttributes: attrs)
+    }
+
+    private static func drawBars(_ labels: [String], _ values: [Double], in r: NSRect, highlight: String?, percent: Int) {
+        let n = labels.count
+        guard n > 0 else { return }
+        let maxV = max(values.max() ?? 1, 0.000001)
+        let labelW: CGFloat = 320
+        let valueW: CGFloat = 180
+        let rowH = r.height / CGFloat(n)
+        let barH = min(rowH * 0.62, 70)
+        let fontSize = min(30, max(18, rowH * 0.38))
+        let byName = highlight.flatMap { hl in labels.firstIndex { $0.caseInsensitiveCompare(hl) == .orderedSame } }
+        let hi = byName ?? values.firstIndex(of: values.max() ?? 0) ?? 0
+        for i in 0..<n {
+            let yc = r.maxY - rowH * (CGFloat(i) + 0.5)
+            let bw = max(4, (r.width - labelW - valueW) * CGFloat(max(values[i], 0) / maxV))
+            let bar = NSRect(x: r.minX + labelW, y: yc - barH / 2, width: bw, height: barH)
+            (i == hi ? accent : muted).setFill()
+            NSBezierPath(roundedRect: bar, xRadius: 8, yRadius: 8).fill()
+            text(short(labels[i], 20), at: NSPoint(x: r.minX + labelW - 20, y: yc - fontSize * 0.62), size: fontSize, weight: i == hi ? .semibold : .regular, color: ink, align: .right)
+            text(fmt(values[i], percent), at: NSPoint(x: bar.maxX + 14, y: yc - fontSize * 0.62), size: fontSize, weight: .semibold, color: ink)
+        }
+    }
+
+    private static func drawLine(_ labels: [String], _ values: [Double], in r: NSRect, percent: Int) {
+        let n = labels.count
+        guard n >= 2 else { drawBars(labels, values, in: r, highlight: nil, percent: percent); return }
+        let plot = NSRect(x: r.minX + 150, y: r.minY + 60, width: r.width - 190, height: r.height - 80)
+        let minV = min(values.min() ?? 0, 0)
+        let maxV = max(values.max() ?? 1, minV + 0.000001)
+        func pt(_ i: Int) -> NSPoint {
+            NSPoint(x: plot.minX + plot.width * CGFloat(i) / CGFloat(n - 1),
+                    y: plot.minY + plot.height * CGFloat((values[i] - minV) / (maxV - minV)))
+        }
+        for g in 0...4 {
+            let v = minV + (maxV - minV) * Double(g) / 4
+            let y = plot.minY + plot.height * CGFloat(g) / 4
+            grid.setStroke()
+            let gl = NSBezierPath()
+            gl.move(to: NSPoint(x: plot.minX, y: y))
+            gl.line(to: NSPoint(x: plot.maxX, y: y))
+            gl.lineWidth = 2
+            gl.stroke()
+            text(fmt(v, percent), at: NSPoint(x: plot.minX - 16, y: y - 12), size: 22, weight: .regular, color: muted, align: .right)
+        }
+        let path = NSBezierPath()
+        path.move(to: pt(0))
+        for i in 1..<n { path.line(to: pt(i)) }
+        path.lineWidth = 6
+        path.lineJoinStyle = .round
+        accent.setStroke()
+        path.stroke()
+        let step = max(1, Int((Double(n) / 8).rounded(.up)))
+        for i in 0..<n {
+            let p = pt(i)
+            accent.setFill()
+            NSBezierPath(ovalIn: NSRect(x: p.x - 8, y: p.y - 8, width: 16, height: 16)).fill()
+            if i % step == 0 || i == n - 1 {
+                text(short(labels[i], 12), at: NSPoint(x: p.x, y: plot.minY - 44), size: 20, weight: .regular, color: muted, align: .center)
+            }
+        }
+        let last = pt(n - 1)
+        text(fmt(values[n - 1], percent), at: NSPoint(x: last.x - 12, y: last.y + 18), size: 26, weight: .bold, color: ink, align: .right)
+    }
+
+    private static func drawPie(_ labels: [String], _ values: [Double], in r: NSRect) {
+        let total = values.reduce(0) { $0 + max($1, 0) }
+        guard total > 0 else { return }
+        let palette = [accent, ink, muted,
+                       NSColor(srgbRed: 0.98, green: 0.65, blue: 0.2, alpha: 1),
+                       NSColor(srgbRed: 0.35, green: 0.55, blue: 0.75, alpha: 1),
+                       NSColor(srgbRed: 0.6, green: 0.75, blue: 0.5, alpha: 1)]
+        let radius = min(r.height, r.width * 0.5) / 2 - 10
+        let center = NSPoint(x: r.minX + radius + 40, y: r.midY)
+        var angle: CGFloat = 90
+        for (i, v) in values.enumerated() {
+            let sweep = CGFloat(max(v, 0) / total) * 360
+            let slice = NSBezierPath()
+            slice.move(to: center)
+            slice.appendArc(withCenter: center, radius: radius, startAngle: angle, endAngle: angle - sweep, clockwise: true)
+            slice.close()
+            palette[i % palette.count].setFill()
+            slice.fill()
+            angle -= sweep
+        }
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: NSRect(x: center.x - radius * 0.55, y: center.y - radius * 0.55, width: radius * 1.1, height: radius * 1.1)).fill()
+        let legendX = center.x + radius + 80
+        let rowH = min(70, r.height / CGFloat(max(values.count, 1)))
+        for (i, v) in values.enumerated() {
+            let y = r.maxY - rowH * (CGFloat(i) + 0.7)
+            palette[i % palette.count].setFill()
+            NSBezierPath(roundedRect: NSRect(x: legendX, y: y, width: 30, height: 30), xRadius: 6, yRadius: 6).fill()
+            let share = String(format: "%.0f%%", max(v, 0) / total * 100)
+            text(short(labels[i], 22) + "   " + share, at: NSPoint(x: legendX + 46, y: y - 2), size: 28, weight: .regular, color: ink)
+        }
+    }
+}
+
+enum ChartMaker {
+    @MainActor
+    static func make(markdown: String, question: String) async -> (png: Data, spec: ChartSpec)? {
+        guard Settings.shared.chartsEnabled, let t = ChartAdvisor.firstTable(markdown) else { return nil }
+        var source = "model"
+        var spec = await ChartAdvisor.llm(t, question: question)
+        if spec == nil {
+            source = "rules"
+            spec = ChartAdvisor.rules(t)
+        }
+        guard let s = spec, s.type != "none" else {
+            Log.write("CHART skipped: \(source) decided a chart would not help")
+            return nil
+        }
+        var labels = t.rows.map { $0[s.x] }
+        var values = t.rows.map { ChartAdvisor.number($0[s.y]) ?? 0 }
+        if s.type == "line", let f = labels.first, let l = labels.last,
+           f.range(of: #"^\d{4}-\d{2}"#, options: .regularExpression) != nil, f > l {
+            labels.reverse()
+            values.reverse()
+        }
+        let cap = s.type == "pie" ? 6 : (s.type == "bar" ? 15 : 60)
+        if labels.count > cap {
+            labels = Array(labels.prefix(cap))
+            values = Array(values.prefix(cap))
+        }
+        let pct = ChartAdvisor.percentMode(t.header[s.y], values)
+        guard let png = ChartRenderer.png(s, labels: labels, values: values, percent: pct) else { return nil }
+        Log.write("CHART \(s.type) chosen by \(source): \(s.title) (\(labels.count) points, \(png.count / 1024) KB)")
+        return (png, s)
+    }
+
+    static func embed(_ png: Data, title: String, in html: String) -> String {
+        let alt = title.replacingOccurrences(of: "\"", with: "'").replacingOccurrences(of: "<", with: "").replacingOccurrences(of: ">", with: "")
+        let img = "<p><img src=\"data:image/png;base64," + png.base64EncodedString() + "\" alt=\"" + alt + "\" width=\"640\" height=\"360\"></p>"
+        var h = html
+        if let r = h.range(of: "<table") {
+            h.insert(contentsOf: img, at: r.lowerBound)
+        } else if let r = h.range(of: "</div>", options: .backwards) {
+            h.insert(contentsOf: img, at: r.lowerBound)
+        } else {
+            h += img
+        }
+        return h
+    }
+}
+EOF
+
 cat > Sources/Bricksper/Auth.swift <<'EOF'
 import Foundation
 import Network
@@ -1229,7 +1798,8 @@ final class OAuthManager {
     private var verifier = ""
     private var state = ""
     private var host = ""
-    private var withGenie = true
+    private var scopeLevel = 0
+    private static let scopeOptions = ["all-apis offline_access ai-gateway genie", "all-apis offline_access ai-gateway", "all-apis offline_access"]
     private var completion: ((Result<OAuthSession, Error>) -> Void)?
 
     private var redirectURI: String { "http://localhost:\(AuthConfig.redirectPort)" }
@@ -1247,10 +1817,10 @@ final class OAuthManager {
         return "✓ Signed in" + (o.email.isEmpty ? "" : " as \(o.email)") + " until \(f.string(from: until))"
     }
 
-    func signIn(host: String, withGenie: Bool = true, completion: @escaping (Result<OAuthSession, Error>) -> Void) {
+    func signIn(host: String, scopeLevel: Int = 0, completion: @escaping (Result<OAuthSession, Error>) -> Void) {
         stopListener()
         self.host = host
-        self.withGenie = withGenie
+        self.scopeLevel = min(scopeLevel, Self.scopeOptions.count - 1)
         self.verifier = Self.randomString(64)
         self.state = Self.randomString(24)
         self.completion = completion
@@ -1271,7 +1841,7 @@ final class OAuthManager {
             URLQueryItem(name: "state", value: state),
             URLQueryItem(name: "code_challenge", value: Self.challenge(for: verifier)),
             URLQueryItem(name: "code_challenge_method", value: "S256"),
-            URLQueryItem(name: "scope", value: withGenie ? "all-apis offline_access genie" : "all-apis offline_access")
+            URLQueryItem(name: "scope", value: Self.scopeOptions[self.scopeLevel])
         ]
         guard let url = c?.url else { finish(.failure(DBError.badHost)); return }
         NSWorkspace.shared.open(url)
@@ -1343,12 +1913,13 @@ final class OAuthManager {
                 Task { @MainActor in await self.exchange(code) }
             } else {
                 let msg = q["error_description"] ?? q["error"] ?? "state mismatch"
-                if self.withGenie && msg.lowercased().contains("scope"), let c = self.completion {
-                    Log.write("Sign-in rejected the genie scope (\(msg)). Retrying with all-apis offline_access only.")
-                    self.respond(conn, status: "200 OK", message: "Retrying sign-in without the Genie scope...")
+                if self.scopeLevel < Self.scopeOptions.count - 1 && msg.lowercased().contains("scope"), let c = self.completion {
+                    let next = self.scopeLevel + 1
+                    Log.write("Sign-in rejected scope '\(Self.scopeOptions[self.scopeLevel])' (\(msg)). Retrying with '\(Self.scopeOptions[next])'.")
+                    self.respond(conn, status: "200 OK", message: "Retrying sign-in with fewer permissions...")
                     self.completion = nil
                     let h = self.host
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.signIn(host: h, withGenie: false, completion: c) }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.signIn(host: h, scopeLevel: next, completion: c) }
                     return
                 }
                 self.respond(conn, status: "200 OK", message: "Sign-in failed: \(msg)")
@@ -1453,6 +2024,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let modelPopup = NSPopUpButton()
     private let customModelField = NSTextField()
     private let genieCheck = NSButton(checkboxWithTitle: "Enable Genie voice mode (say 'Genie' to ask a data question)", target: nil, action: nil)
+    private let chartCheck = NSButton(checkboxWithTitle: "Turn Genie tables into charts (your model picks the chart)", target: nil, action: nil)
     private let saveButton = NSButton(title: "Test & Save", target: nil, action: nil)
     private let genieTestButton = NSButton(title: "Test Genie", target: nil, action: nil)
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
@@ -1578,6 +2150,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         genieCheck.target = self
         genieCheck.action = #selector(toggleGenie)
         genieCheck.state = s.genieEnabled ? .on : .off
+        chartCheck.target = self
+        chartCheck.action = #selector(toggleCharts)
+        chartCheck.state = s.chartsEnabled ? .on : .off
 
         saveButton.target = self
         saveButton.action = #selector(save)
@@ -1600,6 +2175,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [label("Model"), modelPopup],
             [label("Model service"), customModelField],
             [label("Genie"), genieCheck],
+            [NSGridCell.emptyContentView, chartCheck],
             [label("Advanced"), patCheck],
             [label("Personal access token"), tokenField]
         ])
@@ -1669,6 +2245,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         stopRecording()
         onClose?()
+    }
+
+    @objc private func toggleCharts() {
+        Settings.shared.chartsEnabled = chartCheck.state == .on
+        statusLabel.stringValue = chartCheck.state == .on ? "Charts on: suitable Genie tables also paste as a chart." : "Charts off: Genie tables paste as tables only."
     }
 
     @objc private func toggleGenie() {
@@ -1987,6 +2568,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let originPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         var output = g.question
         var html: String?
+        var chartPNG: Data?
+        var pasteKind: PasteTarget = .document
         var usedRaw = false
         var needsSignIn = false
         do {
@@ -1999,6 +2582,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             lastGenieAnswer = answer.text
             lastGenieHTML = answer.html
             lastWasGenie = true
+            pasteKind = target.kind
+            if target.kind != .spreadsheet && target.kind != .plain {
+                genieNote = "Drawing a chart..."
+                tickGenie()
+                if let chart = await ChartMaker.make(markdown: answer.markdown, question: g.question) {
+                    chartPNG = chart.png
+                    if target.kind == .document, let h = html {
+                        let withChart = ChartMaker.embed(chart.png, title: chart.spec.title, in: h)
+                        html = withChart
+                        lastGenieHTML = withChart
+                    }
+                }
+            }
         } catch {
             if Task.isCancelled || (error as? URLError)?.code == .cancelled {
                 Log.write("GENIE cancelled by user")
@@ -2019,7 +2615,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.write("GENIE answer copied only: you switched apps while Genie was thinking. Press Cmd+V where you want it.")
             Paster.copy(output, html: html)
         }
-        let pasted = sameApp && Paster.paste(output, html: html)
+        let pasted: Bool
+        if sameApp, pasteKind == .slides, let png = chartPNG {
+            pasted = Paster.pasteImage(png)
+        } else {
+            pasted = sameApp && Paster.paste(output, html: html)
+            if pasted, pasteKind == .chat, let png = chartPNG {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { Paster.pasteImage(png) }
+            }
+        }
         if !pasted {
             play("Funk")
         } else if usedRaw {
